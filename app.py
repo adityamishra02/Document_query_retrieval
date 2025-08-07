@@ -8,8 +8,6 @@ import google.generativeai as genai
 
 from fastapi import FastAPI, HTTPException, APIRouter, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 from contextlib import asynccontextmanager
@@ -33,7 +31,6 @@ security = HTTPBearer()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    # Increased timeout for potentially slower, more accurate model
     http_client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
     yield
     await http_client.aclose()
@@ -41,14 +38,6 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App Initialization ---
 app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api/v1")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # --- Authentication ---
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -91,7 +80,6 @@ async def download_and_extract_pdf_text(url: str) -> str:
         raise HTTPException(status_code=500, detail=f"PDF Extraction Failed: {str(e)}")
 
 def chunk_text(text: str, max_tokens: int = 450, overlap: int = 100) -> List[str]:
-    # ACCURACY TUNE: Increased overlap to better preserve context between chunks
     words = text.split()
     if not words: return []
     chunks = []
@@ -121,12 +109,9 @@ def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str]
     return [chunks[i] for i in sorted_indices]
 
 async def generate_answer_async(question: str, context: str) -> str:
-    # ACCURACY TUNE: Using a more powerful model for better reasoning
     model = genai.GenerativeModel("gemini-2.5-flash")
-    
-    # ACCURACY TUNE: More explicit and forceful prompt
     prompt = f"""You are a highly analytical assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
-Do not use any outside knowledge. Reply like a human in a single proper sentence.
+Do not use any outside knowledge. Reply like a human in a proper single sentence.
 
 DOCUMENT EXCERPTS:
 ---
@@ -154,7 +139,6 @@ async def run_hackrx(request: RunRequest):
     chunks = chunk_text(document_text)
     if not chunks: raise HTTPException(status_code=400, detail="Document is too short to be processed.")
 
-    # Run embedding tasks in parallel for efficiency
     chunk_embeddings_list, question_embeddings_list = await asyncio.gather(
         embed_content_async(chunks, task_type="retrieval_document"),
         embed_content_async(request.questions, task_type="retrieval_query")
@@ -163,9 +147,7 @@ async def run_hackrx(request: RunRequest):
     question_embeddings = np.array(question_embeddings_list)
     
     async def process_question(idx: int):
-        # ACCURACY TUNE: Retrieve more chunks to create a richer context
         candidate_chunks = find_relevant_chunks_from_embedding(question_embeddings[idx], chunks, chunk_embeddings, top_k=15)
-        # ACCURACY TUNE: Use more of the retrieved chunks in the final context
         relevant_context = "\n---\n".join(candidate_chunks[:7])
         return await generate_answer_async(request.questions[idx], relevant_context)
 
@@ -175,8 +157,3 @@ async def run_hackrx(request: RunRequest):
     return RunResponse(answers=answers)
 
 app.include_router(api_router)
-
-@app.get("/", response_class=FileResponse)
-async def read_index():
-    # This serves your index.html file
-    return "index.html"
