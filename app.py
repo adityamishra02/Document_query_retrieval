@@ -109,9 +109,9 @@ def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str]
     return [chunks[i] for i in sorted_indices]
 
 async def generate_answer_async(question: str, context: str) -> str:
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    prompt = f"""You are a highly analytical assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
-Do not use any outside knowledge. Reply like a human in a proper single sentence.
+    model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    prompt = f"""You are a highly analytical AI assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
+Do not use any outside knowledge. If the answer is not present in the excerpts, you must state: "Based on the provided text, the answer to this question is not available."
 
 DOCUMENT EXCERPTS:
 ---
@@ -139,21 +139,24 @@ async def run_hackrx(request: RunRequest):
     chunks = chunk_text(document_text)
     if not chunks: raise HTTPException(status_code=400, detail="Document is too short to be processed.")
 
-    chunk_embeddings_list, question_embeddings_list = await asyncio.gather(
-        embed_content_async(chunks, task_type="retrieval_document"),
-        embed_content_async(request.questions, task_type="retrieval_query")
-    )
+    chunk_embeddings_list = await embed_content_async(chunks, task_type="retrieval_document")
     chunk_embeddings = np.array(chunk_embeddings_list)
-    question_embeddings = np.array(question_embeddings_list)
     
-    async def process_question(idx: int):
-        candidate_chunks = find_relevant_chunks_from_embedding(question_embeddings[idx], chunks, chunk_embeddings, top_k=15)
-        relevant_context = "\n---\n".join(candidate_chunks[:7])
-        return await generate_answer_async(request.questions[idx], relevant_context)
+    answers = []
+    # STABILITY FIX: Process questions sequentially to avoid hitting API rate limits and reduce memory pressure.
+    for question in request.questions:
+        question_embedding_list = await embed_content_async([question], task_type="retrieval_query")
+        if not question_embedding_list:
+            answers.append("Error generating embedding for the question.")
+            continue
 
-    tasks = [process_question(i) for i in range(len(request.questions))]
-    answers = await asyncio.gather(*tasks)
-    
+        question_embedding = np.array(question_embedding_list[0])
+        candidate_chunks = find_relevant_chunks_from_embedding(question_embedding, chunks, chunk_embeddings, top_k=15)
+        relevant_context = "\n---\n".join(candidate_chunks[:7])
+        answer = await generate_answer_async(question, relevant_context)
+        answers.append(answer)
+        await asyncio.sleep(1) # Add a small delay to be respectful to the API
+
     return RunResponse(answers=answers)
 
 app.include_router(api_router)
