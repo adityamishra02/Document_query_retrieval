@@ -110,8 +110,8 @@ def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str]
 
 async def generate_answer_async(question: str, context: str) -> str:
     model = genai.GenerativeModel("gemini-1.5-flash-latest")
-    prompt = f"""You are a highly analytical AI assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
-Do not use any outside knowledge. If the answer is not present in the excerpts, you must state: "Based on the provided text, the answer to this question is not available."
+    prompt = f"""You are a highly analytical assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
+Do not use any outside knowledge. Reply like a human in a proper single sentence"
 
 DOCUMENT EXCERPTS:
 ---
