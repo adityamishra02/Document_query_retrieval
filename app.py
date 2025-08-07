@@ -13,7 +13,7 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # FastAPI instance
-app = FastAPI()
+app = FastAPI(root_path="/api/v1")
 
 # Pydantic models for request and response
 class RunRequest(BaseModel):
