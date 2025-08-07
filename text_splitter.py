@@ -1,15 +1,7 @@
-from typing import List
-
-def split_text(text: str, max_length: int = 500, overlap: int = 50) -> List[str]:
+def split_text(text, chunk_size=500, overlap=50):
     words = text.split()
     chunks = []
-    start = 0
-
-    while start < len(words):
-        end = start + max_length
-        chunk = " ".join(words[start:end])
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = " ".join(words[i:i+chunk_size])
         chunks.append(chunk)
-        start += max_length - overlap
-
     return chunks
-

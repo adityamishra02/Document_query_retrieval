@@ -1,7 +1,10 @@
-from document_loader import download_and_extract_text
+from document_reader import load_document_from_url
 
-pdf_url = "https://hackrx.in/policies/EDLHLGA23009V012223.pdf"
-text = download_and_extract_text(pdf_url)
+def test_loader():
+    url = "https://example.com/sample.pdf"
+    chunks = load_document_from_url(url)
+    assert len(chunks) > 0
+    print("Test passed!")
 
-# Just print the beginning to verify
-print(text[:1000])
+if __name__ == "__main__":
+    test_loader()
