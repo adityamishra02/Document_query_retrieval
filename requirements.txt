@@ -1,9 +1,11 @@
 fastapi
 uvicorn[standard]
-python-dotenv
 httpx
-pdfplumber
+PyMuPDF
 numpy
-scikit-learn
-gunicorn
 openai
+scikit-learn
+sentence-transformers
+rank-bm25
+langchain-text-splitters
+python-dotenv
