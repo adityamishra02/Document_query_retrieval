@@ -4,7 +4,7 @@ import httpx
 import pdfplumber
 import tempfile
 import numpy as np
-import google.generativeai as genai
+from openai import AsyncOpenAI # Import the async OpenAI client
 
 from fastapi import FastAPI, HTTPException, APIRouter, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -17,8 +17,11 @@ from dotenv import load_dotenv
 # --- Configuration ---
 load_dotenv()
 try:
-    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    # Use OpenAI's environment variable
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     STATIC_API_TOKEN = os.getenv("STATIC_API_TOKEN")
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable not set.")
     if not STATIC_API_TOKEN:
         raise ValueError("STATIC_API_TOKEN environment variable not set.")
 except Exception as e:
@@ -26,14 +29,18 @@ except Exception as e:
 
 # --- Global Objects & Lifespan ---
 http_client = None
+openai_client = None
 security = HTTPBearer()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
+    global http_client, openai_client
     http_client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+    # Initialize the AsyncOpenAI client
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     yield
     await http_client.aclose()
+    await openai_client.close()
 
 # --- FastAPI App Initialization ---
 app = FastAPI(lifespan=lifespan)
@@ -87,18 +94,18 @@ def chunk_text(text: str, max_tokens: int = 450, overlap: int = 100) -> List[str
         chunks.append(" ".join(words[i:i + max_tokens]))
     return chunks
 
-async def embed_content_async(content: List[str], task_type: str, title: str = "Document") -> List[List[float]]:
-    def embed_sync():
-        try:
-            response = genai.embed_content(
-                model="models/embedding-001", content=content, task_type=task_type,
-                title=title if task_type == "retrieval_document" else None
-            )
-            return response["embedding"]
-        except Exception as e:
-            print(f"Error embedding content: {e}")
-            return [[0.0] * 768] * len(content)
-    return await asyncio.to_thread(embed_sync)
+async def embed_content_async(content: List[str]) -> List[List[float]]:
+    try:
+        # Use OpenAI's embedding API
+        response = await openai_client.embeddings.create(
+            model="text-embedding-3-small", # A fast and efficient embedding model
+            input=content
+        )
+        return [embedding.embedding for embedding in response.data]
+    except Exception as e:
+        print(f"Error embedding content with OpenAI: {e}")
+        # Assuming embedding dimension of 1536 for text-embedding-3-small
+        return [[0.0] * 1536] * len(content)
 
 def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str], chunk_embeddings: np.ndarray, top_k: int) -> List[str]:
     actual_top_k = min(top_k, len(chunks))
@@ -109,25 +116,31 @@ def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str]
     return [chunks[i] for i in sorted_indices]
 
 async def generate_answer_async(question: str, context: str) -> str:
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
-    prompt = f"""You are a highly analytical assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
-Do not use any outside knowledge. Reply like a human in a proper single sentence"
+    # Use OpenAI's Chat Completion API
+    system_prompt = """You are a highly analytical assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
+Do not use any outside knowledge. Reply like a human in a single proper sentence"
+Synthesize a concise and direct answer from the excerpts."""
 
+    user_prompt = f"""
 DOCUMENT EXCERPTS:
 ---
 {context}
 ---
 
 QUESTION: {question}
-
-Synthesize a concise and direct answer from the excerpts.
 """
     try:
-        def generate_sync():
-            return model.generate_content(prompt).text.strip()
-        return await asyncio.to_thread(generate_sync)
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini", 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.0, 
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"Error during answer generation: {str(e)}")
+        print(f"Error during answer generation with OpenAI: {e}")
         return f"Error generating answer: {str(e)}"
 
 # --- API Endpoints ---
@@ -139,13 +152,13 @@ async def run_hackrx(request: RunRequest):
     chunks = chunk_text(document_text)
     if not chunks: raise HTTPException(status_code=400, detail="Document is too short to be processed.")
 
-    chunk_embeddings_list = await embed_content_async(chunks, task_type="retrieval_document")
+    chunk_embeddings_list = await embed_content_async(chunks)
     chunk_embeddings = np.array(chunk_embeddings_list)
     
     answers = []
-    # STABILITY FIX: Process questions sequentially to avoid hitting API rate limits and reduce memory pressure.
+    # Process questions sequentially for stability on free tiers
     for question in request.questions:
-        question_embedding_list = await embed_content_async([question], task_type="retrieval_query")
+        question_embedding_list = await embed_content_async([question])
         if not question_embedding_list:
             answers.append("Error generating embedding for the question.")
             continue
@@ -155,7 +168,7 @@ async def run_hackrx(request: RunRequest):
         relevant_context = "\n---\n".join(candidate_chunks[:7])
         answer = await generate_answer_async(question, relevant_context)
         answers.append(answer)
-        await asyncio.sleep(1) # Add a small delay to be respectful to the API
+        await asyncio.sleep(1) # Delay to be respectful to the API
 
     return RunResponse(answers=answers)
 

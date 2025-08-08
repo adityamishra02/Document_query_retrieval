@@ -5,5 +5,5 @@ httpx
 pdfplumber
 numpy
 scikit-learn
-google-generativeai
 gunicorn
+openai
