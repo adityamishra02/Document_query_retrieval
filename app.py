@@ -186,7 +186,7 @@ async def generate_answer_async(question: str, context: str) -> str:
 """
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -229,8 +229,9 @@ async def run_rag_pipeline(request: RunRequest):
         question = request.questions[idx]
         print(f"  - Processing question: '{question[:50]}...'")
         
+        # Reduced top_k from 50 to 20 to speed up the cross-encoder step
         candidate_indices = await hybrid_search(
-            question, child_chunks, chunk_embeddings, bm25_index, top_k=50
+            question, child_chunks, chunk_embeddings, bm25_index, top_k=20
         )
         candidate_chunks = [child_chunks[i] for i in candidate_indices]
         
