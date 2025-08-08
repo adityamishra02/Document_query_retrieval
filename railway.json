@@ -4,6 +4,7 @@
       "builder": "NIXPACKS",
       "nixpacksConfig": {
         "providers": ["python"],
+        "installCmd": "pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt",
         "startCmd": "uvicorn app:app --host 0.0.0.0 --port $PORT"
       }
     },
