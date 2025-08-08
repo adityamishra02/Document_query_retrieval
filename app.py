@@ -4,7 +4,7 @@ import httpx
 import pdfplumber
 import tempfile
 import numpy as np
-from openai import AsyncOpenAI 
+from openai import AsyncOpenAI
 
 from fastapi import FastAPI, HTTPException, APIRouter, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -34,8 +34,8 @@ security = HTTPBearer()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, openai_client
+    # Timeout suitable for concurrent requests on a powerful model
     http_client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
-
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     yield
     await http_client.aclose()
@@ -85,8 +85,7 @@ async def download_and_extract_pdf_text(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF Extraction Failed: {str(e)}")
 
-def chunk_text(text: str, max_tokens: int = 300, overlap: int = 50) -> List[str]:
-
+def chunk_text(text: str, max_tokens: int = 350, overlap: int = 75) -> List[str]:
     words = text.split()
     if not words: return []
     chunks = []
@@ -130,8 +129,8 @@ QUESTION: {question}
 """
     try:
         response = await openai_client.chat.completions.create(
-
-            model="gpt-5-mini",
+            # Using a fast and accurate model
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -151,25 +150,22 @@ async def run_hackrx(request: RunRequest):
     chunks = chunk_text(document_text)
     if not chunks: raise HTTPException(status_code=400, detail="Document is too short to be processed.")
 
-    chunk_embeddings_list = await embed_content_async(chunks)
+    # SPEED: Batch embed all chunks and all questions in parallel
+    chunk_embeddings_list, question_embeddings_list = await asyncio.gather(
+        embed_content_async(chunks),
+        embed_content_async(request.questions)
+    )
     chunk_embeddings = np.array(chunk_embeddings_list)
+    question_embeddings = np.array(question_embeddings_list)
     
-    answers = []
-    for question in request.questions:
-        question_embedding_list = await embed_content_async([question])
-        if not question_embedding_list:
-            answers.append("Error generating embedding for the question.")
-            continue
-
-        question_embedding = np.array(question_embedding_list[0])
-
-        candidate_chunks = find_relevant_chunks_from_embedding(question_embedding, chunks, chunk_embeddings, top_k=20)
-
+    async def process_question(idx: int):
+        candidate_chunks = find_relevant_chunks_from_embedding(question_embeddings[idx], chunks, chunk_embeddings, top_k=20)
         relevant_context = "\n---\n".join(candidate_chunks[:10])
-        answer = await generate_answer_async(question, relevant_context)
-        answers.append(answer)
-        await asyncio.sleep(1)
+        return await generate_answer_async(request.questions[idx], relevant_context)
 
+    tasks = [process_question(i) for i in range(len(request.questions))]
+    answers = await asyncio.gather(*tasks)
+    
     return RunResponse(answers=answers)
 
 app.include_router(api_router)
