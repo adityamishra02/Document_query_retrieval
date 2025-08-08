@@ -85,7 +85,8 @@ async def download_and_extract_pdf_text(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF Extraction Failed: {str(e)}")
 
-def chunk_text(text: str, max_tokens: int = 350, overlap: int = 75) -> List[str]:
+def chunk_text(text: str, max_tokens: int = 250, overlap: int = 50) -> List[str]:
+    # FINAL ACCURACY TUNE: Smaller, more granular chunks for better retrieval on specific questions.
     words = text.split()
     if not words: return []
     chunks = []
@@ -158,6 +159,7 @@ async def run_hackrx(request: RunRequest):
     chunk_embeddings = np.array(chunk_embeddings_list)
     question_embeddings = np.array(question_embeddings_list)
     
+    # SPEED: Process all questions concurrently
     async def process_question(idx: int):
         candidate_chunks = find_relevant_chunks_from_embedding(question_embeddings[idx], chunks, chunk_embeddings, top_k=20)
         relevant_context = "\n---\n".join(candidate_chunks[:10])
