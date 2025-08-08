@@ -4,7 +4,7 @@ import httpx
 import pdfplumber
 import tempfile
 import numpy as np
-from openai import AsyncOpenAI # Import the async OpenAI client
+from openai import AsyncOpenAI 
 
 from fastapi import FastAPI, HTTPException, APIRouter, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 # --- Configuration ---
 load_dotenv()
 try:
-    # Use OpenAI's environment variable
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     STATIC_API_TOKEN = os.getenv("STATIC_API_TOKEN")
     if not OPENAI_API_KEY:
@@ -35,8 +34,8 @@ security = HTTPBearer()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client, openai_client
-    http_client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
-    # Initialize the AsyncOpenAI client
+    http_client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
+
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     yield
     await http_client.aclose()
@@ -86,7 +85,8 @@ async def download_and_extract_pdf_text(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF Extraction Failed: {str(e)}")
 
-def chunk_text(text: str, max_tokens: int = 450, overlap: int = 100) -> List[str]:
+def chunk_text(text: str, max_tokens: int = 300, overlap: int = 50) -> List[str]:
+
     words = text.split()
     if not words: return []
     chunks = []
@@ -96,15 +96,13 @@ def chunk_text(text: str, max_tokens: int = 450, overlap: int = 100) -> List[str
 
 async def embed_content_async(content: List[str]) -> List[List[float]]:
     try:
-        # Use OpenAI's embedding API
         response = await openai_client.embeddings.create(
-            model="text-embedding-3-small", # A fast and efficient embedding model
+            model="text-embedding-3-small",
             input=content
         )
         return [embedding.embedding for embedding in response.data]
     except Exception as e:
         print(f"Error embedding content with OpenAI: {e}")
-        # Assuming embedding dimension of 1536 for text-embedding-3-small
         return [[0.0] * 1536] * len(content)
 
 def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str], chunk_embeddings: np.ndarray, top_k: int) -> List[str]:
@@ -116,10 +114,11 @@ def find_relevant_chunks_from_embedding(embedding: np.ndarray, chunks: List[str]
     return [chunks[i] for i in sorted_indices]
 
 async def generate_answer_async(question: str, context: str) -> str:
-    # Use OpenAI's Chat Completion API
-    system_prompt = """You are a highly analytical assistant. Your task is to answer the user's question based *exclusively* on the provided "DOCUMENT EXCERPTS".
-Do not use any outside knowledge. Reply like a human in a single proper sentence"
-Synthesize a concise and direct answer from the excerpts."""
+    system_prompt = """You are a helpful insurance assistant. Your task is to answer the user's question based *only* on the provided policy excerpts.
+- Summarize the key information into a single, clear sentence.
+- Do not use legal jargon or quote directly from the text.
+- Sound like a helpful human explaining the policy.
+- If the answer isn't in the text, say "Based on the provided text, that information is not available." """
 
     user_prompt = f"""
 DOCUMENT EXCERPTS:
@@ -131,12 +130,12 @@ QUESTION: {question}
 """
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-5-mini", 
+
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.0, 
+            ]
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -156,7 +155,6 @@ async def run_hackrx(request: RunRequest):
     chunk_embeddings = np.array(chunk_embeddings_list)
     
     answers = []
-    # Process questions sequentially for stability on free tiers
     for question in request.questions:
         question_embedding_list = await embed_content_async([question])
         if not question_embedding_list:
@@ -164,11 +162,13 @@ async def run_hackrx(request: RunRequest):
             continue
 
         question_embedding = np.array(question_embedding_list[0])
-        candidate_chunks = find_relevant_chunks_from_embedding(question_embedding, chunks, chunk_embeddings, top_k=15)
-        relevant_context = "\n---\n".join(candidate_chunks[:7])
+
+        candidate_chunks = find_relevant_chunks_from_embedding(question_embedding, chunks, chunk_embeddings, top_k=20)
+
+        relevant_context = "\n---\n".join(candidate_chunks[:10])
         answer = await generate_answer_async(question, relevant_context)
         answers.append(answer)
-        await asyncio.sleep(1) # Delay to be respectful to the API
+        await asyncio.sleep(1)
 
     return RunResponse(answers=answers)
 
