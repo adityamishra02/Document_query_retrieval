@@ -98,7 +98,7 @@ async def generate_answer_async(question: str, context: str) -> str:
     prompt = f"""
 You are a highly factual assistant. You must answer strictly using the provided policy document excerpts.
 If the answer is not explicitly in the context, respond with "Not specified in the document."
-Do not add any extra information or make assumptions.
+Do not add any extra information or make assumptions. Respond like a human in a single proper sentence
 
 Context:
 {context}
