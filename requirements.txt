@@ -1,13 +1,15 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-fastapi
-uvicorn[standard]
-httpx
-PyMuPDF
-numpy
-openai
-scikit-learn
-sentence-transformers
-rank-bm25
-langchain-text-splitters
+# Web Framework
+flask
+
+# Database ORM (Object-Relational Mapper)
+flask-sqlalchemy
+psycopg2-binary
+
+# API and Schema Validation
+pydantic
+
+# Environment Variables
 python-dotenv
+
+# Production Web Server
+gunicorn
