@@ -1,8 +1,11 @@
 fastapi
 uvicorn
-PyPDF2
-requests
-python-multipart
-pydantic
-langchain
+gunicorn
+httpx
 openai
+PyMuPDF
+numpy
+scikit-learn
+rank-bm25
+langchain-text-splitters
+python-dotenv
