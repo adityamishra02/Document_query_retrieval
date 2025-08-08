@@ -110,7 +110,7 @@ Answer only using the facts from the context.
 """
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
         )
