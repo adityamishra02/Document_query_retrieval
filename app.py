@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Accurate Lite RAG", lifespan=lifespan)
 api_router = APIRouter(prefix="/api/v1")
 
+# --- Pydantic Schemas ---
 class RunRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -68,7 +69,7 @@ async def download_and_extract_pdf_text(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF download or parsing failed: {e}")
 
-# --- Improved Chunking ---
+# --- Text Chunking ---
 def create_chunks(text: str) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     return splitter.split_text(text)
@@ -78,21 +79,25 @@ async def embed_content_async(texts: List[str]) -> np.ndarray:
     response = await openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
     return np.array([r.embedding for r in response.data])
 
-# --- Semantic + BM25 Hybrid Search ---
-async def hybrid_search(query: str, chunks: List[str], embeddings: np.ndarray, bm25: BM25Okapi, top_k: int = 10) -> List[str]:
+# --- Hybrid Search ---
+async def hybrid_search(query: str, chunks: List[str], embeddings: np.ndarray, bm25: BM25Okapi, top_k: int = 20) -> List[str]:
     query_embedding = await embed_content_async([query])
     vector_scores = cosine_similarity(query_embedding, embeddings)[0]
     bm25_scores = bm25.get_scores(query.lower().split())
 
-    # Combine scores with weighted average (favor embeddings)
-    final_scores = 0.7 * vector_scores + 0.3 * (np.array(bm25_scores) / max(bm25_scores))
+    bm25_norm = np.array(bm25_scores)
+    if bm25_norm.max() > 0:
+        bm25_norm = bm25_norm / bm25_norm.max()
+
+    final_scores = 0.7 * vector_scores + 0.3 * bm25_norm
     top_indices = np.argsort(final_scores)[::-1][:top_k]
     return [chunks[i] for i in top_indices]
 
-# --- Answer Generation (Improved Prompt) ---
+# --- Answer Generation ---
 async def generate_answer_async(question: str, context: str) -> str:
     prompt = f"""
-You are a highly factual assistant. Use only the following policy document excerpts to answer the question. 
+You are a highly factual assistant. You must answer strictly using the provided policy document excerpts.
+If the answer is not explicitly in the context, respond with "Not specified in the document."
 Do not add any extra information or make assumptions.
 
 Context:
@@ -113,7 +118,7 @@ Answer only using the facts from the context.
     except Exception as e:
         return f"Error generating answer: {e}"
 
-# --- API Endpoint ---
+# --- Main Endpoint ---
 @api_router.post("/hackrx/run", response_model=RunResponse, dependencies=[Depends(verify_token)])
 async def run_rag_pipeline(request: RunRequest):
     text = await download_and_extract_pdf_text(request.documents)
@@ -125,11 +130,14 @@ async def run_rag_pipeline(request: RunRequest):
     bm25_index = BM25Okapi([c.lower().split() for c in chunks])
 
     async def process_question(q: str) -> str:
-        relevant_chunks = await hybrid_search(q, chunks, embeddings, bm25_index)
+        relevant_chunks = await hybrid_search(q, chunks, embeddings, bm25_index, top_k=20)
         context = "\n---\n".join(relevant_chunks)
+        if len(context) > 10000:  # Safety limit
+            context = context[:10000]
         return await generate_answer_async(q, context)
 
     answers = await asyncio.gather(*(process_question(q) for q in request.questions))
     return RunResponse(answers=answers)
 
+# --- Register the router ---
 app.include_router(api_router)
