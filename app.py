@@ -166,11 +166,11 @@ def rerank_with_cross_encoder(query: str, chunks: List[str]) -> List[str]:
     return ranked_chunks
 
 async def generate_answer_async(question: str, context: str) -> str:
-    system_prompt = """You are a helpful AI assistant. Your primary goal is to answer the user's question clearly and concisely based *only* on the provided policy excerpts.
+    system_prompt = """You are a precision-focused AI assistant. Your most important task is to answer the user's question with the highest possible accuracy, based *only* on the provided document excerpts.
 
-- **Aim for a single, conversational sentence** that sounds like a human explaining the policy.
-- **If necessary to include all critical details, conditions, or exceptions (such as specific bed counts, network exceptions, or coverage limitations), you may expand to a short, easy-to-read paragraph.**
-- If the answer isn't in the text, you must say: "Based on the provided text, that information is not available."
+- **Accuracy is the top priority.** You must include all critical details, conditions, exceptions, and specific numbers (like bed counts, percentages, or monetary limits).
+- **Synthesize, do not just copy.** Create a clear and comprehensive answer. You may use a single sentence or a short paragraph as needed to be both complete and readable.
+- **If the answer is not in the text, you must state:** "Based on the provided text, that information is not available." Do not guess or infer information.
 """
 
     user_prompt = f"""
@@ -186,7 +186,7 @@ async def generate_answer_async(question: str, context: str) -> str:
 """
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -198,7 +198,7 @@ async def generate_answer_async(question: str, context: str) -> str:
         print(f"Error during answer generation with OpenAI: {e}")
         return f"Error generating answer: {str(e)}"
 
-@api_router.post("/run", response_model=RunResponse, dependencies=[Depends(verify_token)])
+@api_router.post("/hackrx/run", response_model=RunResponse, dependencies=[Depends(verify_token)])
 async def run_rag_pipeline(request: RunRequest):
     print("Step 1: Downloading and parsing document...")
     document_text = await download_and_extract_pdf_text(request.documents)
