@@ -5,7 +5,7 @@ langchain
 langchain-openai
 langchain-community
 rank_bm25
-chroma-db
+chromadb
 PyMuPDF
 httpx
 python-dotenv
