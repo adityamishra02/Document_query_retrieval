@@ -3,160 +3,220 @@ import asyncio
 import httpx
 import fitz
 import tempfile
-import numpy as np
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Dict
+from collections import defaultdict
 
 from openai import AsyncOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import chromadb
+from chromadb.utils import embedding_functions
+from rank_bm25 import BM25Okapi
+
 from fastapi import FastAPI, HTTPException, APIRouter, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel, Field
+
 from dotenv import load_dotenv
 
-
 load_dotenv()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 STATIC_API_TOKEN = os.getenv("STATIC_API_TOKEN")
 
-if not OPENAI_API_KEY or not STATIC_API_TOKEN:
-    raise RuntimeError("OPENAI_API_KEY or STATIC_API_TOKEN is missing")
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_DIMENSIONS = 1024
+GENERATION_MODEL = "gpt-4o"
 
+RETRIEVER_TOP_N = 10
+COMPRESSOR_TOP_K = 5
+RRF_K = 60
 
-http_client = None
-openai_client = None
-security = HTTPBearer()
+http_client: httpx.AsyncClient = None
+openai_client: AsyncOpenAI = None
+chroma_client: chromadb.Client = None
+openai_ef = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Asynchronous context manager for FastAPI application lifespan events.
-    Initializes and closes HTTP client and OpenAI client.
-    """
-    global http_client, openai_client
+    global http_client, openai_client, chroma_client, openai_ef
+    
     http_client = httpx.AsyncClient(timeout=120.0)
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    chroma_client = chromadb.Client()
+
+    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        api_key=OPENAI_API_KEY,
+        model_name=EMBEDDING_MODEL
+    )
+    
+    print("Application startup complete. Clients initialized.")
     yield
+    
     await http_client.aclose()
+    print("Application shutdown complete. Clients closed.")
 
-app = FastAPI(title="Fast GPT-5 RAG", lifespan=lifespan)
+app = FastAPI(
+    title="Optimized RAG Pipeline",
+    description="An advanced RAG implementation based on modern research.",
+    lifespan=lifespan
+)
 api_router = APIRouter(prefix="/api/v1")
-
+security = HTTPBearer()
 
 class RunRequest(BaseModel):
-    documents: str
-    questions: List[str]
+    documents: str = Field(..., description="URL of the PDF document to process.")
+    questions: List[str] = Field(..., description="List of questions to answer based on the document.")
 
 class RunResponse(BaseModel):
     answers: List[str]
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """
-    Verifies the provided API token against the static token.
-    Raises HTTPException if the token is invalid.
-    """
     if credentials.scheme != "Bearer" or credentials.credentials != STATIC_API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid API Token")
     return True
 
-
 def extract_text_from_pdf(file_path: str) -> str:
-    """
-    Extracts all text content from a given PDF file.
-    """
-    with fitz.open(file_path) as doc:
-        return "\n".join([page.get_text() for page in doc])
+    try:
+        with fitz.open(file_path) as doc:
+            return "\n".join(page.get_text() for page in doc)
+    except Exception as e:
+        print(f"Error extracting text from PDF {file_path}: {e}")
+        return ""
 
 async def download_and_extract_pdf_text(url: str) -> str:
-    """
-    Downloads a PDF from a URL and extracts its text content.
-    """
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(response.content)
-                tmp_file.flush()
-
-                return await asyncio.to_thread(extract_text_from_pdf, tmp_file.name)
+        response = await http_client.get(url)
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as tmp_file:
+            tmp_file.write(response.content)
+            tmp_file.flush()
+            return await asyncio.to_thread(extract_text_from_pdf, tmp_file.name)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to download PDF: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF download or parsing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {e}")
 
-async def embed_content_async(texts: List[str]) -> np.ndarray:
-    """
-    Generates embeddings for a list of texts using OpenAI's API.
-    """
-    resp = await openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
-    return np.array([r.embedding for r in resp.data])
-
-
-async def hybrid_search(query: str, chunks: List[str], embeddings: np.ndarray, bm25: BM25Okapi, top_k: int = 3) -> List[str]:
-    """
-    Performs a hybrid search combining vector similarity and BM25 scores.
-    """
-    query_embedding = await embed_content_async([query])
-    vector_scores = cosine_similarity(query_embedding, embeddings)[0]
+def reciprocal_rank_fusion(*ranked_lists: List[str], k: int = 60) -> List[str]:
+    rrf_scores = defaultdict(float)
+    for rank_list in ranked_lists:
+        for rank, doc_id in enumerate(rank_list, 1):
+            rrf_scores[doc_id] += 1 / (k + rank)
     
-    bm25_scores = bm25.get_scores(query.lower().split())
+    return sorted(rrf_scores.keys(), key=rrf_scores.get, reverse=True)
 
-    bm25_max = bm25_scores.max()
-    bm25_norm = bm25_scores / bm25_max if bm25_max > 0 else bm25_scores
+async def hybrid_search(query: str, collection: chromadb.Collection, bm25_index: BM25Okapi, all_chunks: Dict[str, str]) -> List[str]:
+    vector_results = await asyncio.to_thread(
+        collection.query,
+        query_texts=[query],
+        n_results=RETRIEVER_TOP_N
+    )
+    vector_doc_ids = vector_results['ids'][0]
+
+    tokenized_query = query.lower().split()
+    bm25_scores = bm25_index.get_scores(tokenized_query)
     
+    top_bm25_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:RETRIEVER_TOP_N]
+    bm25_doc_ids = [f"chunk_{i}" for i in top_bm25_indices]
 
-    final_scores = 0.7 * vector_scores + 0.3 * bm25_norm
+    fused_ids = reciprocal_rank_fusion(vector_doc_ids, bm25_doc_ids, k=RRF_K)
     
-    top_indices = np.argsort(final_scores)[::-1][:top_k]
-    return [chunks[i] for i in top_indices]
+    return [all_chunks[doc_id] for doc_id in fused_ids[:RETRIEVER_TOP_N]]
 
+async def compress_context_async(question: str, context_chunks: List[str]) -> str:
+    context_str = "\n---\n".join(context_chunks)
+    prompt = f"""
+Given the following question and a set of context documents, extract all sentences from the documents that are directly relevant to answering the question. If no sentences are relevant, respond with an empty string.
 
-async def generate_answer_async(question: str, context: str) -> str:
-    """
-    Generates an answer to a question based on the provided context using an LLM.
-    """
-    prompt = f"Answer the question using only the given context. Be precise.\nContext:\n{context}\nQuestion: {question}"
+<question>
+{question}
+</question>
+
+<documents>
+{context_str}
+</documents>
+
+Relevant sentences:
+"""
     try:
         resp = await openai_client.chat.completions.create(
-            model="gpt-5", 
+            model=GENERATION_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        return f"Error generating answer: {e}"
+        print(f"Error during context compression: {e}")
+        return context_str
 
+async def generate_answer_async(question: str, context: str) -> str:
+    prompt = f"""
+You are an expert Question-Answering assistant. Your task is to answer the user's question with high accuracy.
+Follow these instructions precisely:
+1.  Base your answer *only* on the information contained within the provided <context> documents. Do not use any external knowledge.
+2.  If the answer cannot be found in the provided context, you must respond with the exact phrase: "Based on the information provided, an answer cannot be determined."
+3.  Be concise and do not repeat long passages from the context verbatim. Synthesize the information.
+
+<context>
+{context}
+</context>
+
+<question>
+{question}
+</question>
+
+Answer:
+"""
+    try:
+        resp = await openai_client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Error during answer generation: {e}")
+        return "Error: Could not generate an answer due to an internal issue."
 
 @api_router.post("/hackrx/run", response_model=RunResponse, dependencies=[Depends(verify_token)])
 async def run_rag_pipeline(request: RunRequest):
-    """
-    The main RAG pipeline endpoint. It downloads a PDF, processes it, and answers questions.
-    """
     text = await download_and_extract_pdf_text(request.documents)
     if not text.strip():
-        raise HTTPException(status_code=400, detail="Document is empty or unreadable")
+        raise HTTPException(status_code=400, detail="Document is empty or unreadable.")
 
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.split_text(text)
-    
+    chunk_ids = [f"chunk_{i}" for i in range(len(chunks))]
+    all_chunks_dict = dict(zip(chunk_ids, chunks))
 
-    embeddings = await embed_content_async(chunks)
-    bm25_index = BM25Okapi([c.lower().split() for c in chunks])
+    collection_name = f"rag_{os.urandom(8).hex()}"
+    collection = chroma_client.create_collection(
+        name=collection_name,
+        embedding_function=openai_ef
+    )
+    
+    await asyncio.to_thread(
+        collection.add,
+        ids=chunk_ids,
+        documents=chunks
+    )
+    
+    tokenized_chunks = [c.lower().split() for c in chunks]
+    bm25_index = BM25Okapi(tokenized_chunks)
 
     async def process_question(q: str) -> str:
-        relevant_chunks = await hybrid_search(q, chunks, embeddings, bm25_index, top_k=3)
-        context = "\n---\n".join(relevant_chunks)
+        retrieved_chunks = await hybrid_search(q, collection, bm25_index, all_chunks_dict)
         
+        compressed_context = await compress_context_async(q, retrieved_chunks)
+        if not compressed_context.strip():
+            return "Based on the information provided, an answer cannot be determined."
 
-        if len(context) > 12000: 
-            context = context[:12000]
-            
-        return await generate_answer_async(q, context)
+        return await generate_answer_async(q, compressed_context)
 
-
-    answers = await asyncio.gather(*(process_question(q) for q in request.questions))
-    return RunResponse(answers=answers)
-
+    try:
+        answers = await asyncio.gather(*(process_question(q) for q in request.questions))
+        return RunResponse(answers=answers)
+    finally:
+        chroma_client.delete_collection(name=collection_name)
 
 app.include_router(api_router)
