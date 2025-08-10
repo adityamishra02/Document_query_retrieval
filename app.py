@@ -1,7 +1,7 @@
 import os
 import asyncio
 import httpx
-import fitz  # PyMuPDF
+import fitz  
 import tempfile
 import numpy as np
 from contextlib import asynccontextmanager
@@ -17,7 +17,6 @@ from rank_bm25 import BM25Okapi
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
 
-# --- Load environment variables ---
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 STATIC_API_TOKEN = os.getenv("STATIC_API_TOKEN")
@@ -25,7 +24,6 @@ STATIC_API_TOKEN = os.getenv("STATIC_API_TOKEN")
 if not OPENAI_API_KEY or not STATIC_API_TOKEN:
     raise RuntimeError("OPENAI_API_KEY or STATIC_API_TOKEN is missing")
 
-# --- Global Clients ---
 http_client = None
 openai_client = None
 security = HTTPBearer()
@@ -41,7 +39,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Fast GPT-5 RAG", lifespan=lifespan)
 api_router = APIRouter(prefix="/api/v1")
 
-# --- Schemas ---
 class RunRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -54,7 +51,6 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
 
-# --- PDF Extraction ---
 def extract_text_from_pdf(file_path: str) -> str:
     with fitz.open(file_path) as doc:
         return "\n".join([page.get_text() for page in doc])
@@ -70,7 +66,6 @@ async def download_and_extract_pdf_text(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF download or parsing failed: {e}")
 
-# --- Text Chunking ---
 def create_chunks(text: str) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
     return splitter.split_text(text)
@@ -78,24 +73,19 @@ def create_chunks(text: str) -> List[str]:
 def deduplicate_chunks(chunks: List[str]) -> List[str]:
     return list(OrderedDict.fromkeys(chunks))
 
-# --- Embeddings ---
 async def embed_content_async(texts: List[str]) -> np.ndarray:
     resp = await openai_client.embeddings.create(input=texts, model="text-embedding-3-small")
     return np.array([r.embedding for r in resp.data])
 
-# --- Hybrid Search ---
 async def hybrid_search(query: str, chunks: List[str], embeddings: np.ndarray, bm25: BM25Okapi, top_k: int = 15) -> List[str]:
     query_embedding = await embed_content_async([query])
     vector_scores = cosine_similarity(query_embedding, embeddings)[0]
     bm25_scores = bm25.get_scores(query.lower().split())
-
     bm25_norm = bm25_scores / bm25_scores.max() if bm25_scores.max() > 0 else bm25_scores
     final_scores = 0.6 * vector_scores + 0.4 * bm25_norm
-
     top_indices = np.argsort(final_scores)[::-1][:top_k]
     return [chunks[i] for i in top_indices]
 
-# --- Answer Generation ---
 async def generate_answer_async(question: str, context: str) -> str:
     prompt = (
         "You are a domain expert. Answer the question strictly based on the provided context. "
@@ -112,7 +102,6 @@ async def generate_answer_async(question: str, context: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-# --- Main Endpoint ---
 @api_router.post("/hackrx/run", response_model=RunResponse, dependencies=[Depends(verify_token)])
 async def run_rag_pipeline(request: RunRequest):
     text = await download_and_extract_pdf_text(request.documents)
@@ -124,21 +113,19 @@ async def run_rag_pipeline(request: RunRequest):
     bm25_index = BM25Okapi([c.lower().split() for c in chunks])
 
     async def process_question(q: str) -> str:
-        relevant_chunks = await hybrid_search(q, chunks, embeddings, bm25_index, top_k=15)
-        relevant_chunks = deduplicate_chunks(relevant_chunks)
+        relevant_chunks = deduplicate_chunks(await hybrid_search(q, chunks, embeddings, bm25_index, top_k=15))
         context = "\n---\n".join(relevant_chunks)
         if len(context) > 9000:
             context = context[:9000]
         answer = await generate_answer_async(q, context)
         if "No relevant information" in answer:
-            # Try fallback: top 5 BM25 chunks only
             fallback_chunks = [chunks[i] for i in np.argsort(bm25_index.get_scores(q.lower().split()))[::-1][:5]]
             context_fb = "\n---\n".join(fallback_chunks)
             answer = await generate_answer_async(q, context_fb)
-        return answer
+        return answer.replace("\n", " ").strip()
 
     answers = await asyncio.gather(*(process_question(q) for q in request.questions))
+    answers = [a.replace("\n", " ").strip() for a in answers]
     return RunResponse(answers=answers)
 
-# --- Register router ---
 app.include_router(api_router)
