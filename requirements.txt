@@ -9,3 +9,4 @@ chromadb
 PyMuPDF
 httpx
 python-dotenv
+scikit-learn
