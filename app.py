@@ -5,6 +5,7 @@ import fitz
 import tempfile
 import numpy as np
 import uuid
+import time
 from contextlib import asynccontextmanager
 from typing import List, Dict, Optional
 
@@ -25,11 +26,13 @@ STATIC_API_TOKEN = os.getenv("STATIC_API_TOKEN")
 if not OPENAI_API_KEY or not STATIC_API_TOKEN:
     raise RuntimeError("OPENAI_API_KEY or STATIC_API_TOKEN is missing")
 
-# --- Global state ---
+# --- Global ---
 http_client = None
 openai_client = None
 security = HTTPBearer()
 jobs: Dict[str, Dict] = {}  # in-memory job store
+
+JOB_TTL = 600  # 10 minutes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,6 +53,7 @@ class RunRequest(BaseModel):
 class JobResponse(BaseModel):
     job_id: str
     status: str
+    answers: Optional[List[str]] = None
 
 class StatusResponse(BaseModel):
     job_id: str
@@ -69,15 +73,12 @@ def extract_text_from_pdf(file_path: str) -> str:
         return "\n".join([page.get_text() for page in doc])
 
 async def download_and_extract_pdf_text(url: str) -> str:
-    try:
-        response = await http_client.get(url)
-        response.raise_for_status()
-        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_file:
-            tmp_file.write(response.content)
-            tmp_file.flush()
-            return await asyncio.to_thread(extract_text_from_pdf, tmp_file.name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF download or parsing failed: {e}")
+    response = await http_client.get(url)
+    response.raise_for_status()
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_file:
+        tmp_file.write(response.content)
+        tmp_file.flush()
+        return await asyncio.to_thread(extract_text_from_pdf, tmp_file.name)
 
 # --- Chunking ---
 def create_chunks(text: str) -> List[str]:
@@ -102,14 +103,18 @@ async def hybrid_search(query: str, chunks: List[str], embeddings: np.ndarray, b
 # --- Answer generation ---
 async def generate_answer_async(question: str, context: str) -> str:
     prompt = f"Answer the question using only the given context. Be precise.\nContext:\n{context}\nQuestion: {question}"
-    try:
-        resp = await openai_client.chat.completions.create(
-            model="gpt-5",
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Error: {e}"
+    resp = await openai_client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.choices[0].message.content.strip()
+
+# --- Cleanup old jobs ---
+def cleanup_jobs():
+    now = time.time()
+    to_delete = [jid for jid, job in jobs.items() if now - job["created"] > JOB_TTL]
+    for jid in to_delete:
+        del jobs[jid]
 
 # --- Background processing ---
 async def process_job(job_id: str, request: RunRequest):
@@ -117,7 +122,7 @@ async def process_job(job_id: str, request: RunRequest):
         jobs[job_id]["status"] = "processing"
         text = await download_and_extract_pdf_text(request.documents)
         if not text.strip():
-            jobs[job_id] = {"status": "error", "error": "Document is empty or unreadable"}
+            jobs[job_id] = {"status": "error", "error": "Document is empty or unreadable", "created": time.time()}
             return
 
         chunks = await asyncio.to_thread(create_chunks, text)
@@ -132,20 +137,32 @@ async def process_job(job_id: str, request: RunRequest):
             return await generate_answer_async(q, context)
 
         answers = await asyncio.gather(*(process_question(q) for q in request.questions))
-        jobs[job_id] = {"status": "completed", "answers": answers}
+        jobs[job_id] = {"status": "completed", "answers": answers, "created": time.time()}
     except Exception as e:
-        jobs[job_id] = {"status": "error", "error": str(e)}
+        jobs[job_id] = {"status": "error", "error": str(e), "created": time.time()}
 
 # --- Endpoints ---
 @api_router.post("/hackrx/run", response_model=JobResponse, dependencies=[Depends(verify_token)])
 async def start_job(request: RunRequest, background_tasks: BackgroundTasks):
+    cleanup_jobs()
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued"}
+    jobs[job_id] = {"status": "queued", "created": time.time()}
+    task = asyncio.create_task(process_job(job_id, request))
+
+    try:
+        # Wait briefly to try to complete immediately
+        await asyncio.wait_for(task, timeout=3)
+        if jobs[job_id]["status"] == "completed":
+            return JobResponse(job_id=job_id, status="completed", answers=jobs[job_id]["answers"])
+    except asyncio.TimeoutError:
+        pass  # Still processing
+
     background_tasks.add_task(process_job, job_id, request)
     return JobResponse(job_id=job_id, status="queued")
 
 @api_router.get("/hackrx/status/{job_id}", response_model=StatusResponse, dependencies=[Depends(verify_token)])
 async def get_job_status(job_id: str):
+    cleanup_jobs()
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
