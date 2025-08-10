@@ -88,7 +88,7 @@ async def generate_answer_async(question: str, context: str) -> str:
     prompt = f"Answer the question using only the given context. Be precise.\nContext:\n{context}\nQuestion: {question}"
     try:
         resp = await openai_client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-5-mini",
             messages=[{"role": "user", "content": prompt}],
         )
         return resp.choices[0].message.content.strip()
